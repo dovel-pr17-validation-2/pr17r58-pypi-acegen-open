@@ -1,0 +1,32 @@
+name: acegen
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - flake8
+  - pytest
+  - pytest-cov
+  - hydra-core
+  - tqdm
+  - wandb
+  - rdkit>=2023.3.3
+  - ninja # speeds up causal-conv1d / mamba-ssm extension builds
+  - cmake # same
+  - pip:
+    # PyTorch CUDA wheels. Replace cu128 with your CUDA version if needed
+    # (e.g. cu126, cu124); keep it in sync with pyproject.toml and requirements.txt.
+    - --index-url https://download.pytorch.org/whl/cu128
+    # Required so the non-PyTorch packages below still resolve from PyPI.
+    - --extra-index-url https://pypi.org/simple
+    # Pinned in lockstep with pyproject.toml / requirements.txt. torchrl ships a
+    # compiled extension linked against a specific libtorch ABI, so these four
+    # versions must be upgraded together, never individually.
+    - torch==2.11.0
+    - torchvision
+    - torchrl==0.11.1
+    - tensordict==0.11.0
+    - MolScore
+    - promptsmiles
+    - git+https://github.com/Acellera/acegen-open.git

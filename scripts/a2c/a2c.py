@@ -1,0 +1,321 @@
+#! /usr/bin/python3
+import datetime
+import os
+import random
+from packaging import version
+from pathlib import Path
+
+import hydra
+import numpy as np
+
+import torch
+import tqdm
+import yaml
+
+from acegen.script_helpers import set_seed, run_task
+from acegen.models import adapt_state_dict, models, register_model
+from acegen.rl_env import generate_complete_smiles, TokenEnv
+from acegen.scoring_functions import (
+    custom_scoring_functions,
+    register_custom_scoring_function,
+    Task,
+)
+from acegen.vocabulary import Vocabulary
+from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
+from torch.distributions.kl import kl_divergence
+from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
+
+from torchrl.envs import InitTracker, TransformedEnv
+from torchrl.modules.utils import get_primers_from_module
+from torchrl.objectives import A2CLoss
+from acegen._compat import make_gae as GAE
+from torchrl.record.loggers import get_logger
+
+try:
+    import molscore
+    from molscore import MolScoreBenchmark, MolScoreCurriculum
+    from molscore.manager import MolScore
+
+    _has_molscore = True
+    if hasattr(molscore, "__version__"):
+        _molscore_version = version.parse(molscore.__version__)
+    else:
+        _molscore_version = version.parse("1.0")
+except ImportError as err:
+    _has_molscore = False
+    MOLSCORE_ERR = err
+
+# hydra outputs saved in /tmp
+os.chdir("/tmp")
+
+def set_seed(seed):
+    """Set random seed for reproducibility."""
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+
+@hydra.main(
+    config_path=".",
+    config_name="config_denovo",
+    version_base="1.2",
+)
+def main(cfg: "DictConfig"):
+    run_task(cfg, run_a2c, __file__)
+    
+
+def run_a2c(cfg, task):
+    
+    # Set seed
+    set_seed(cfg.seed)
+
+    # Get available device
+    device = (
+        torch.device("cuda:0") if torch.cuda.device_count() > 0 else torch.device("cpu")
+    )
+
+    # If custom model, register it
+    if cfg.model not in models and cfg.get("custom_model_factory", None) is not None:
+        register_model(cfg.model, cfg.model_factory)
+
+    # Check if model is available
+    if cfg.model not in models:
+        raise ValueError(
+            f"Model {cfg.model} not found. For custom models, define a model factory as explain in the tutorials."
+        )
+
+    # Get model
+    (create_actor, create_critic, create_shared, voc_path, ckpt_path, tokenizer) = (
+        models[cfg.model]
+    )
+
+    # Create vocabulary
+    ####################################################################################################################
+
+    vocabulary = Vocabulary.load(voc_path, tokenizer=tokenizer)
+
+    # Create models
+    ####################################################################################################################
+
+    # Create actor and critic networks
+    if cfg.shared_nets:
+        (
+            actor_training,
+            actor_inference,
+            critic_training,
+            critic_inference,
+        ) = create_shared(vocabulary_size=len(vocabulary))
+    else:
+        actor_training, actor_inference = create_actor(len(vocabulary))
+        critic_training, critic_inference = create_critic(len(vocabulary))
+
+    # Load pretrained weights
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    actor_inference.load_state_dict(
+        adapt_state_dict(ckpt, actor_inference.state_dict())
+    )
+    actor_training.load_state_dict(adapt_state_dict(ckpt, actor_training.state_dict()))
+    actor_inference = actor_inference.to(device)
+    actor_training = actor_training.to(device)
+    critic_training = critic_training.to(device)
+
+    # Define prior
+    prior, _ = create_actor(len(vocabulary))
+    prior = prior.to(device)
+    prior.load_state_dict(adapt_state_dict(ckpt, prior.state_dict()))
+
+    # Create RL environment
+    ####################################################################################################################
+
+    # Define environment kwargs
+    env_kwargs = {
+        "start_token": vocabulary.start_token_index,
+        "end_token": vocabulary.end_token_index,
+        "length_vocabulary": len(vocabulary),
+        "batch_size": cfg.num_envs,
+        "device": device,
+    }
+
+    # Define environment creation function
+    def create_env_fn():
+        """Create a single RL rl_env."""
+        env = TokenEnv(**env_kwargs)
+        env = TransformedEnv(env)
+        env.append_transform(InitTracker())
+        if primers := get_primers_from_module(actor_inference):
+            env.append_transform(primers)
+        if primers := get_primers_from_module(critic_inference):
+            env.append_transform(primers)
+        return env
+
+    env = create_env_fn()
+
+    # Create loss module
+    ####################################################################################################################
+
+    adv_module = GAE(
+        gamma=cfg.gamma,
+        lmbda=cfg.lmbda,
+        value_network=critic_training,
+        average_gae=True,
+        shifted=True,
+    )
+    loss_module = A2CLoss(
+        actor_network=actor_training,
+        critic_network=critic_training,
+        critic_coeff=cfg.critic_coef,
+        entropy_coeff=cfg.entropy_coef,
+        loss_critic_type="l2",
+    )
+
+    # Create data storage
+    ####################################################################################################################
+
+    buffer = TensorDictReplayBuffer(
+        storage=LazyTensorStorage(cfg.num_envs, device=device),
+        sampler=SamplerWithoutReplacement(),
+        batch_size=cfg.mini_batch_size,
+        prefetch=4,
+    )
+
+    # Create optimizer
+    ####################################################################################################################
+
+    optim = torch.optim.Adam(
+        loss_module.parameters(),
+        lr=cfg.lr,
+        eps=cfg.eps,
+        weight_decay=cfg.weight_decay,
+    )
+
+    # Create logger
+    ####################################################################################################################
+
+    logger = None
+    if cfg.logger_backend:
+        experiment_name = f"{cfg.agent_name}"
+        try:
+            experiment_name += f"_{task.cfg.get('task')}"
+        except AttributeError:
+            experiment_name += "_custom_task"
+        logger = get_logger(
+            cfg.logger_backend,
+            logger_name=cfg.save_dir,
+            experiment_name=experiment_name,
+            wandb_kwargs={
+                "config": dict(cfg),
+                "project": cfg.experiment_name,
+                "group": cfg.agent_name,
+                "reinit": True,
+            },
+        )
+
+    # Training loop
+    ####################################################################################################################
+
+    total_done = 0
+    num_updates = 0
+    kl_coef = cfg.kl_coef
+    max_grad_norm = cfg.max_grad_norm
+    pbar = tqdm.tqdm(total=cfg.total_smiles)
+    losses = TensorDict({}, batch_size=[])
+
+    while not task.finished:
+
+        # Generate data
+        data = generate_complete_smiles(
+            policy_sample=actor_inference,
+            policy_evaluate=actor_training,
+            vocabulary=vocabulary,
+            scoring_function=task,
+            environment=env,
+            prompt=cfg.get("prompt", None),
+            promptsmiles=cfg.get("promptsmiles", None),
+            promptsmiles_optimize=cfg.get("promptsmiles_optimize", True),
+            promptsmiles_shuffle=cfg.get("promptsmiles_shuffle", True),
+            promptsmiles_multi=cfg.get("promptsmiles_multi", False),
+            promptsmiles_scan=cfg.get("promptsmiles_scan", False),
+            remove_duplicates=True,
+        )
+
+        # Update progress bar
+        data_next = data.get("next")
+        done = data_next.get("done").squeeze(-1)
+        pbar.update(done.sum().item())
+
+        # Register smiles lengths and real rewards and total generated smiles
+        log_info = {}
+        total_done += done.sum().item()
+        episode_rewards = data_next["reward"][done]
+        episode_length = (data_next["observation"] != 0.0).float().sum(-1).mean()
+        if len(episode_rewards) > 0:
+            log_info.update(
+                {
+                    "train/total_smiles": total_done,
+                    "train/reward": episode_rewards.mean().item(),
+                    "train/min_reward": episode_rewards.min().item(),
+                    "train/max_reward": episode_rewards.max().item(),
+                    "train/episode_length": episode_length.item(),
+                }
+            )
+
+        # Compute advantage
+        with torch.no_grad():
+            data = adv_module(data)
+
+        # Add extended_data to buffer
+        buffer.extend(data)
+
+        for j, batch in enumerate(buffer):
+
+            # Compute A2C losses
+            mask = batch.get("mask").squeeze(-1)
+            loss = loss_module(batch)
+            loss = loss.named_apply(
+                lambda name, value: (
+                    (value * mask).mean() if name.startswith("loss_") else value
+                ),
+                batch_size=[],
+            )
+
+            # Compute KL loss term
+            with torch.no_grad():
+                prior_dist = prior.get_dist(batch)
+            kl_div = kl_divergence(actor_training.get_dist(batch), prior_dist)
+            kl_div = (kl_div * mask.squeeze()).sum(-1).mean(-1)
+
+            # Compute total loss
+            loss_sum = (
+                loss["loss_critic"]
+                + loss["loss_objective"]
+                + loss["loss_entropy"]
+                + kl_div * kl_coef
+            )
+
+            # Store losses for logging
+            losses = loss.select(
+                "loss_critic", "loss_entropy", "loss_objective"
+            ).detach()
+            losses["kl_div"] = kl_div.detach()
+
+            # Update policy
+            loss_sum.backward()
+            torch.nn.utils.clip_grad_norm_(
+                loss_module.parameters(), max_norm=max_grad_norm
+            )
+            optim.step()
+            optim.zero_grad()
+            num_updates += 1
+
+        losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
+        for key, value in losses_mean.items():
+            log_info.update({f"train/{key}": value.item()})
+
+        if logger:
+            for key, value in log_info.items():
+                logger.log_scalar(key, value, step=total_done)
+
+
+if __name__ == "__main__":
+    main()
